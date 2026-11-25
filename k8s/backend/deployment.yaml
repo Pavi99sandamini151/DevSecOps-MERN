@@ -1,0 +1,132 @@
+# =============================================================================
+# Backend Deployment — Node / Express API
+# =============================================================================
+# BEGINNER MAP
+#   Same idea as frontend Deployment, plus:
+#     - Mongo credentials from Secret mongo-sec (created by eks-post-setup.sh)
+#     - Probes so Kubernetes knows when the API is alive / ready / started
+#     - OTEL env vars so tracing.js can export spans to the collector
+#     - Prometheus scrape annotations on port 9090
+#
+# WHY three probes (liveness / readiness / startup)?
+#   startup  → give a slow boot time before other probes start failing
+#   readiness → if /ready fails, stop sending traffic (but do not restart yet)
+#   liveness  → if /healthz fails, restart the container
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: three-tier
+  labels:
+    role: api
+    env: demo
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 25%
+  selector:
+    matchLabels:
+      role: api
+  template:
+    metadata:
+      labels:
+        role: api
+      annotations:
+        # Helps Prometheus find this Pod (ServiceMonitor is the preferred modern way)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: backend-sa
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: api
+        # CI on gitops branch rewrites this to …/backend:<pipeline_iid>
+        image: ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/backend:IMAGE_TAG_PLACEHOLDER
+        imagePullPolicy: Always
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        env:
+          - name: USE_DB_AUTH
+            value: "true"
+          # In-cluster DNS name of the MongoDB Service
+          - name: MONGO_CONN_STR
+            value: "mongodb://mongodb-svc:27017/todo?authSource=admin&directConnection=true"
+          - name: ALLOWED_ORIGIN
+            value: "https://devops.example.com"
+          - name: METRICS_PORT
+            value: "9090"
+          - name: OTEL_SERVICE_NAME
+            value: "backend"
+          - name: OTEL_EXPORTER_OTLP_ENDPOINT
+            value: "http://otel-collector.monitoring.svc.cluster.local:4318"
+          # Injected from Secret — never hard-code passwords in YAML (C10)
+          - name: MONGO_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: mongo-sec
+                key: mongodb-username
+          - name: MONGO_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: mongo-sec
+                key: mongodb-password
+        volumeMounts:
+          - name: mongo-creds
+            mountPath: /etc/mongo-creds
+            readOnly: true
+          - name: tmp
+            mountPath: /tmp
+        ports:
+        - name: http
+          containerPort: 3500
+        - name: metrics
+          containerPort: 9090
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 3500
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 3500
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        startupProbe:
+          httpGet:
+            path: /started
+            port: 3500
+          initialDelaySeconds: 0
+          periodSeconds: 10
+          failureThreshold: 30
+      volumes:
+        - name: mongo-creds
+          secret:
+            secretName: mongo-sec
+        - name: tmp
+          emptyDir: {}

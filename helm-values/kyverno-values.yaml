@@ -1,0 +1,15 @@
+# Kyverno Helm values
+# IRSA annotation for ECR pull is applied by scripts/kyverno-ecr-access.sh via --set
+# (role ARN is account-specific). Keep base values here.
+replicaCount: 2
+admissionController:
+  replicas: 2
+  # After running kyverno-ecr-access.sh, the SA is annotated with:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/kyverno-ecr-pull
+  # so Cosign/Kyverno can GetAuthorizationToken against private ECR (C5/C10).
+resources:
+  limits:
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi

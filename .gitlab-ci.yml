@@ -1,0 +1,104 @@
+# =============================================================================
+# Root GitLab CI — DevSecOps MERN on EKS
+# =============================================================================
+# BEGINNER MAP (read this first)
+#   Think of this file as the "table of contents" for the whole pipeline.
+#   It does three things only:
+#     1) Lists the order of stages (like chapters in a book).
+#     2) Pulls in smaller CI files from ci/ so this file stays short.
+#     3) Turns on GitLab's built-in security scanners and pins them to our runner.
+#
+# WHY not put every job here?
+#   Frontend, backend, and Terraform each have many jobs. Splitting them into
+#   ci/*.yml keeps the repo readable and lets path filters stay next to the jobs.
+#
+# PRACTICE
+#   - C4/C9: scanners fail the pipeline (allow_failure: false) — no "warnings only".
+#   - C8: path filters live on jobs inside includes — NOT on include: itself
+#     (GitLab would skip the whole file too early and break shared templates).
+#   - needs: [] on security jobs so they never wait on manual Terraform stages.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# stages = the left-to-right order you see in the GitLab pipeline UI
+# ---------------------------------------------------------------------------
+# Infra stages only CREATE jobs when infra files change (see ci/infra.gitlab-ci.yml).
+# If no infra jobs exist, GitLab simply skips those empty stages — app CI still runs.
+stages:
+  # --- Infrastructure (Terraform) — costly / destructive → mostly manual ---
+  - init      # terraform init (download providers into .terraform/)
+  - validate  # syntax + provider schema check (cheap safety net)
+  - plan      # "what would change?" → saved as an artifact for humans
+  - apply     # actually change AWS (manual Play button)
+  - destroy   # tear everything down (manual Play button)
+  # --- App DevSecOps chain (frontend + backend share these names) ---
+  - sonarqube-analysis      # static code quality / bugs / smells
+  - quality-gate            # wait until Sonar says OK or FAIL (not just "scan done")
+  - owasp-dependency-check  # known CVEs in npm packages + npm audit
+  - trivy-file-scan         # filesystem / lockfile vulns before we build an image
+  - docker-build            # build the container image locally on the runner
+  - ecr-push                # tag with pipeline IID and push to Amazon ECR
+  - trivy-image-scan        # scan the *pushed* image layers (OS + app deps)
+  - image-sign              # Cosign keyless signature (Kyverno can verify later)
+  - update-manifest         # commit new image tag to the gitops branch (ArgoCD)
+  # --- GitLab built-in templates insist on these exact stage names ---
+  - test
+  - secret-detection        # finds leaked passwords/tokens in the git history/diff
+  - sast                    # Semgrep and friends (code patterns that look dangerous)
+
+variables:
+  # How chatty GitLab security analyzers are in the job log
+  SECURE_LOG_LEVEL: "info"
+  # Also run analyzers on merge-request pipelines (not only on main pushes)
+  AST_ENABLE_MR_PIPELINES: "true"
+
+# ---------------------------------------------------------------------------
+# include = "load these other YAML files and merge their jobs into this pipeline"
+# ---------------------------------------------------------------------------
+include:
+  - local: ci/tools-cache.gitlab-ci.yml   # shared tool versions / .ci-cache paths
+  - local: ci/infra.gitlab-ci.yml         # Terraform jobs (gated) — C7/C8
+  - local: ci/frontend.gitlab-ci.yml      # React app DevSecOps chain
+  - local: ci/backend.gitlab-ci.yml       # Node API DevSecOps chain
+  # Official GitLab templates (downloaded from GitLab.com when the pipeline starts)
+  - template: Security/Secret-Detection.gitlab-ci.yml
+  - template: Security/SAST.gitlab-ci.yml
+
+# ---------------------------------------------------------------------------
+# Override the template defaults so scanners match our security posture
+# ---------------------------------------------------------------------------
+# WHY tags: [devsecops]?
+#   Only our dedicated EC2 runner has the Docker socket + SonarQube.
+#   Shared GitLab.com runners would fail these jobs or be unsafe for our secrets.
+#
+# WHY allow_failure: false?
+#   If a secret is found, the pipeline must go red. "Yellow warning" is fake security (C9).
+#
+# WHY needs: []?
+#   Empty needs means "start immediately — do not wait for earlier stages".
+#   Otherwise a leftover manual tf-init would block secret scanning forever.
+secret_detection:
+  tags: [devsecops]
+  allow_failure: false
+  needs: []
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# `sast` is only a parent config block in the template. If GitLab runs the parent
+# job itself, it always exits 1. So we disable the parent and harden the child.
+sast:
+  tags: [devsecops]
+  allow_failure: false
+  rules:
+    - when: never   # never schedule the parent job
+
+# This is the real Semgrep SAST analyzer job from the template
+semgrep-sast:
+  tags: [devsecops]
+  allow_failure: false
+  needs: []
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - when: never   # fall-through: do not run on tags/schedules/etc.

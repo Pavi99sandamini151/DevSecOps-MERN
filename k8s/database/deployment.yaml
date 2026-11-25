@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: three-tier
+  name: mongodb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      serviceAccountName: database-sa
+      automountServiceAccountToken: false
+      # Bitnami MongoDB runs as uid 1001 — supports runAsNonRoot (C4/G11)
+      securityContext:
+        fsGroup: 1001
+        runAsNonRoot: true
+        runAsUser: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: mongodb
+        # Bitnami moved free images off docker.io/bitnami → bitnamilegacy (7.0 tag 404 on old path)
+        image: bitnamilegacy/mongodb:7.0
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1001
+          allowPrivilegeEscalation: false
+          # Bitnami needs writable paths — do NOT set readOnlyRootFilesystem
+          capabilities:
+            drop: ["ALL"]
+        ports:
+        - containerPort: 27017
+        # Bitnami env var names (G11) — keep as env vars for entrypoint (C5)
+        env:
+          - name: MONGODB_ROOT_USER
+            valueFrom:
+              secretKeyRef:
+                name: mongo-sec
+                key: mongodb-root-user
+          - name: MONGODB_ROOT_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: mongo-sec
+                key: mongodb-root-password
+          - name: MONGODB_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: mongo-sec
+                key: mongodb-username
+          - name: MONGODB_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: mongo-sec
+                key: mongodb-password
+          - name: MONGODB_DATABASE
+            value: "todo"
+        volumeMounts:
+          - name: mongo-volume
+            mountPath: /bitnami/mongodb
+          - name: tmp
+            mountPath: /tmp
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+      volumes:
+      - name: mongo-volume
+        persistentVolumeClaim:
+          claimName: mongo-volume-claim
+      - name: tmp
+        emptyDir: {}

@@ -1,0 +1,15 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: three-tier-app
+  namespace: argocd
+spec:
+  description: Three-tier MERN application workloads
+  sourceRepos:
+    - "*"
+  destinations:
+    - namespace: three-tier
+      server: https://kubernetes.default.svc
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"

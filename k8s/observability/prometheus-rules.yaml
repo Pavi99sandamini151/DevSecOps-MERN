@@ -1,0 +1,57 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: backend-alerts
+  namespace: three-tier
+  labels:
+    release: prometheus
+    app: backend
+spec:
+  groups:
+    - name: backend.rules
+      interval: 30s
+      rules:
+        - alert: BackendDown
+          expr: up{job="backend", namespace="three-tier"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Backend metrics target is down"
+            description: "Prometheus cannot scrape backend /metrics in three-tier for >2m."
+
+        - alert: BackendHighErrorRate
+          expr: |
+            (
+              sum(rate(http_requests_total{namespace="three-tier", status_code=~"5.."}[5m]))
+              /
+              clamp_min(sum(rate(http_requests_total{namespace="three-tier"}[5m])), 0.001)
+            ) > 0.05
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Backend 5xx rate > 5%"
+            description: "Elevated HTTP 5xx ratio on backend API."
+
+        - alert: BackendHighLatency
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le) (rate(http_request_duration_seconds_bucket{namespace="three-tier", route=~"/api/tasks.*"}[5m]))
+            ) > 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Backend p95 latency > 1s"
+            description: "Task API p95 latency is above 1 second."
+
+        - alert: MongoNotReady
+          expr: mongodb_ready{namespace="three-tier"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Backend MongoDB not ready"
+            description: "mongodb_ready gauge is 0 — mongoose not connected."

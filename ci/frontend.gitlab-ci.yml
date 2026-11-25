@@ -1,0 +1,473 @@
+# =============================================================================
+# Frontend DevSecOps pipeline (React / CRA → static serve image)
+# =============================================================================
+# BEGINNER MAP — what happens when you push to app/frontend/**
+#   1) SonarQube reads the source for bugs / smells
+#   2) Quality gate polls until Sonar says OK (or FAIL)
+#   3) OWASP Dependency-Check + npm audit look for vulnerable packages
+#   4) Trivy scans the filesystem / lockfile
+#   5) Docker builds the image
+#   6) Image is pushed to ECR with tag = CI_PIPELINE_IID (immutable)
+#   7) Trivy scans the *image*; Cosign signs it
+#   8) We commit the new image tag to the `gitops` branch → ArgoCD deploys
+#
+# WHY path filters on each job (C8)?
+#   Backend changes should not rebuild frontend (and vice versa). Saves time + money.
+#
+# WHY job variables under .frontend_rules (not file top-level)?
+#   GitLab MERGES include-level `variables:`. Backend used to overwrite APP_DIR,
+#   so frontend Trivy accidentally scanned the backend. Scope vars to the template.
+#
+# PRACTICE: C1/C6 GitOps + [skip ci] on manifest commits; C4/C9 fail-closed scans;
+#           C5 immutable ECR tags + Cosign; C3 OIDC for AWS (no static keys).
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Shared AWS login for jobs that talk to ECR
+# ---------------------------------------------------------------------------
+# WHAT: Install aws+jq in the Alpine docker:27 image, then assume AWS_ROLE_ARN.
+# WHY AWS_ROLE_ARN (not AWS_INFRA_ROLE_ARN)?
+#   App role is least-privilege: ECR push/pull + Cosign bits only (C2).
+#   Infra role can change VPC/EKS — we never give that to docker-build jobs.
+.oidc_aws_app:
+  image:
+    name: docker:27
+    entrypoint: [""] # let GitLab inject /bin/sh scripts
+  tags: [devsecops]
+  id_tokens:
+    # AWS STS trust policy audience (must match infra/oidc)
+    AWS_JWT:
+      aud: https://gitlab.com
+    # Sigstore Fulcio audience — MUST be "sigstore", not the AWS JWT (C5)
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  before_script:
+    - |
+      set -euo pipefail
+      # docker:27 is Alpine — use apk, not apt-get
+      apk add --no-cache aws-cli jq curl >/dev/null
+      # OIDC: GitLab JWT → temporary AWS credentials (expire in 1h)
+      CREDS=$(aws sts assume-role-with-web-identity \
+        --role-arn "${AWS_ROLE_ARN}" \
+        --role-session-name "gitlab-app-${CI_JOB_ID}" \
+        --web-identity-token "${AWS_JWT}" \
+        --duration-seconds 3600 \
+        --query 'Credentials' \
+        --output json)
+      export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r .AccessKeyId)
+      export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r .SecretAccessKey)
+      export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .SessionToken)
+
+# ---------------------------------------------------------------------------
+# Per-job defaults: which folder, which ECR repo, when to run
+# ---------------------------------------------------------------------------
+.frontend_rules:
+  variables:
+    SONAR_PROJECT_KEY: "three-tier-frontend" # must match SonarQube project key
+    APP_DIR: "app/frontend"                  # where package.json + Dockerfile live
+    MANIFEST_DIR: "k8s/frontend"             # Deployment YAML ArgoCD watches
+    IMAGE_NAME: "$ECR_REPO_FRONTEND"         # short ECR repo name from CI variables
+  rules:
+    # Push to main AND frontend (or this CI file) changed
+    - if: $CI_COMMIT_BRANCH == "main"
+      changes:
+        - app/frontend/**/*
+        - ci/frontend.gitlab-ci.yml
+    # Manual "Run pipeline" from the UI (useful for retries)
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+# =============================================================================
+# 1) SonarQube analysis
+# =============================================================================
+# WHAT: Runs sonar-scanner against the frontend source.
+# WHY on the runner host?
+#   SonarQube is a long-lived Docker container on the EC2 (port 9000).
+#   Job containers reach it via --network host → http://127.0.0.1:9000.
+#   Using the public IP from inside a job often times out (SG / hairpin NAT).
+# WHY docker:27 + host socket?
+#   We need the Docker CLI to start/wait for sonarqube and to run the scanner image.
+frontend:sonarqube-analysis:
+  extends: .frontend_rules
+  image:
+    name: docker:27
+    entrypoint: [""]
+  stage: sonarqube-analysis
+  tags: [devsecops]
+  allow_failure: false # C9: red pipeline if scan cannot run
+  needs: []            # start now — do not wait on Terraform
+  variables:
+    SONAR_URL: "http://127.0.0.1:9000"
+    SONAR_SCANNER_IMAGE: "sonarsource/sonar-scanner-cli:11.1"
+  script:
+    - |
+      set -euo pipefail
+      # Ensure the SonarQube container exists and is running (idempotent)
+      if ! docker ps --format '{{.Names}}' | grep -qx sonarqube; then
+        echo "Starting SonarQube container..."
+        docker start sonarqube 2>/dev/null || docker run -d --name sonarqube \
+          --restart unless-stopped \
+          -p 9000:9000 \
+          -v sonarqube_data:/opt/sonarqube/data \
+          -v sonarqube_logs:/opt/sonarqube/logs \
+          -v sonarqube_extensions:/opt/sonarqube/extensions \
+          sonarqube:lts-community
+      fi
+      # Wait until the API reports UP (cold start can take a few minutes)
+      echo "Waiting for SonarQube at ${SONAR_URL}..."
+      i=0
+      until docker run --rm --network host curlimages/curl:8.5.0 \
+          -sf "${SONAR_URL}/api/system/status" | grep -q '"status":"UP"'; do
+        i=$((i + 1))
+        [ "$i" -ge 60 ] && { echo "SonarQube did not become UP in time"; docker logs sonarqube 2>&1 | tail -40; exit 1; }
+        sleep 5
+      done
+      echo "SonarQube is UP"
+      # Mount source read-only; write .scannerwork to /tmp (bind mount is often not writable)
+      docker run --rm --network host \
+        -u root \
+        -e SONAR_USER_HOME=/tmp/.sonar \
+        -v "${CI_PROJECT_DIR}/${APP_DIR}:/usr/src:ro" \
+        -w /usr/src \
+        --entrypoint sonar-scanner \
+        "${SONAR_SCANNER_IMAGE}" \
+        -Dsonar.projectName=${SONAR_PROJECT_KEY} \
+        -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+        -Dsonar.sources=. \
+        -Dsonar.working.directory=/tmp/.scannerwork \
+        -Dsonar.host.url=${SONAR_URL} \
+        -Dsonar.login=${SONAR_TOKEN}
+
+# =============================================================================
+# 2) Quality gate — "did Sonar PASS or FAIL?"
+# =============================================================================
+# WHAT: Polls SonarQube until the project quality gate is OK or ERROR.
+# WHY separate from analysis?
+#   Analysis finishing ≠ gate passed. Sonar needs a few seconds to compute the gate.
+#   We fail the pipeline on ERROR so bad code never gets packaged (C4/C9).
+frontend:quality-gate:
+  extends: .frontend_rules
+  image:
+    name: docker:27
+    entrypoint: [""]
+  stage: quality-gate
+  tags: [devsecops]
+  allow_failure: false
+  needs: ["frontend:sonarqube-analysis"]
+  variables:
+    SONAR_URL: "http://127.0.0.1:9000"
+  script:
+    - |
+      set -euo pipefail
+      ATTEMPTS=0
+      STATUS="NONE"
+      until [ "$ATTEMPTS" -ge 20 ]; do
+        # curl-jq image already has both tools — no apk on every poll
+        STATUS=$(docker run --rm --network host --entrypoint sh badouralix/curl-jq -c \
+          "curl -s -u '${SONAR_TOKEN}:' \
+            '${SONAR_URL}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}' \
+            | jq -r '.projectStatus.status'")
+        echo "Quality gate status: ${STATUS} (attempt ${ATTEMPTS})"
+        [ "$STATUS" = "OK" ] && break
+        [ "$STATUS" = "ERROR" ] && echo "Quality gate FAILED" && exit 1
+        ATTEMPTS=$((ATTEMPTS + 1))
+        sleep 10
+      done
+      [ "$STATUS" = "OK" ] || { echo "Quality gate timed out with status=${STATUS}"; exit 1; }
+
+# =============================================================================
+# 3) OWASP Dependency-Check + npm audit
+# =============================================================================
+# WHAT:
+#   - OWASP DC: matches your dependencies against the NVD CVE database
+#   - npm audit: uses the npm advisory DB for the same idea (faster, npm-native)
+# WHY --omit=dev on npm audit?
+#   CRA's react-scripts lives in devDependencies and has known highs that never
+#   ship in the production image (we multi-stage build → serve static files).
+#   Auditing runtime deps only matches what actually runs in prod (C4).
+# WHY cache + --noupdate?
+#   First NVD sync can take a long time. If odc.mv.db already exists in cache,
+#   skip the update to avoid multi-hour re-downloads and flaky NVD URLs.
+frontend:owasp-dependency-check:
+  extends: .frontend_rules
+  image:
+    name: node:18-bookworm
+    entrypoint: [""]
+  stage: owasp-dependency-check
+  tags: [devsecops]
+  allow_failure: false
+  needs: []
+  timeout: 60 minutes # cold NVD sync is slow the first time
+  variables:
+    DC_VERSION: "12.1.0" # pin: older 10.x had NVD URL bugs
+    DC_HOME: "${CI_PROJECT_DIR}/.ci-cache/owasp/dependency-check"
+    DC_DATA: "${CI_PROJECT_DIR}/.ci-cache/owasp/data"
+  cache:
+    key: "owasp-dc-12.1.0"
+    paths:
+      - .ci-cache/owasp/
+    policy: pull-push
+  script:
+    - |
+      set -euo pipefail
+      apt-get update -qq
+      # JRE required — Dependency-Check is a Java app
+      apt-get install -y -qq default-jre-headless unzip wget >/dev/null
+      mkdir -p "${DC_DATA}"
+      if [ ! -x "${DC_HOME}/bin/dependency-check.sh" ]; then
+        echo "Downloading OWASP Dependency-Check ${DC_VERSION} (cache miss)..."
+        wget -q "https://github.com/jeremylong/DependencyCheck/releases/download/v${DC_VERSION}/dependency-check-${DC_VERSION}-release.zip" -O /tmp/dc.zip
+        unzip -qo /tmp/dc.zip -d "${CI_PROJECT_DIR}/.ci-cache/owasp"
+        rm -f /tmp/dc.zip
+      else
+        echo "Using cached OWASP Dependency-Check at ${DC_HOME}"
+      fi
+    - cd ${APP_DIR}
+    - |
+      DC_EXTRA=()
+      if [ -f "${DC_DATA}/odc.mv.db" ] || ls "${DC_DATA}"/*.h2.db >/dev/null 2>&1; then
+        echo "Using cached NVD data ( --noupdate )"
+        DC_EXTRA+=(--noupdate)
+      fi
+      "${DC_HOME}/bin/dependency-check.sh" \
+        --project "${SONAR_PROJECT_KEY}" \
+        --scan . \
+        --format HTML --format JSON \
+        --out . \
+        --data "${DC_DATA}" \
+        --nvdValidForHours 168 \
+        --disableOssIndex \
+        --disableKnownExploited \
+        "${DC_EXTRA[@]}"
+    # Runtime deps only — CRA toolchain stays in devDependencies
+    - npm audit --omit=dev --audit-level=high
+  artifacts:
+    when: always # keep reports even on failure so you can download and read them
+    paths:
+      - ${APP_DIR}/dependency-check-report.html
+      - ${APP_DIR}/dependency-check-report.json
+    expire_in: 7 days
+
+# =============================================================================
+# 4) Trivy filesystem scan (before docker build)
+# =============================================================================
+# WHAT: Looks for vulns in lockfiles / OS packages in the source tree.
+# WHY before build?
+#   Fail early — no point building/pushing an image if the lockfile is already bad.
+# WHY --ignore-unfixed?
+#   If upstream has no patch yet, failing forever is noise. We still fail on
+#   CRITICAL/HIGH that DO have a fix available (C4/C9).
+frontend:trivy-file-scan:
+  extends: .frontend_rules
+  image:
+    name: aquasec/trivy:0.57.1
+    entrypoint: [""]
+  stage: trivy-file-scan
+  tags: [devsecops]
+  allow_failure: false
+  needs: []
+  cache:
+    key: "trivy-db-${TRIVY_VERSION}"
+    paths:
+      - .ci-cache/trivy/
+    policy: pull-push
+  script:
+    - mkdir -p "${TRIVY_CACHE_DIR}"
+    - |
+      trivy fs --cache-dir "${TRIVY_CACHE_DIR}" \
+        --scanners vuln \
+        --exit-code 1 --severity CRITICAL,HIGH --ignore-unfixed \
+        --format table -o trivy-fs-frontend.txt "${APP_DIR}"
+  artifacts:
+    when: always
+    paths:
+      - trivy-fs-frontend.txt
+    expire_in: 7 days
+
+# =============================================================================
+# 5) Docker build
+# =============================================================================
+# WHAT: Builds the image defined by app/frontend/Dockerfile on the runner.
+# WHY needs quality-gate + owasp + trivy?
+#   Packaging is only allowed after security / quality checks pass (shift-left).
+# WHY docker system prune?
+#   Runners fill disk with old layers; prune keeps builds from dying on ENOSPC.
+frontend:docker-build:
+  extends: .frontend_rules
+  image:
+    name: docker:27
+    entrypoint: [""]
+  stage: docker-build
+  tags: [devsecops]
+  allow_failure: false
+  needs:
+    - frontend:quality-gate
+    - frontend:owasp-dependency-check
+    - frontend:trivy-file-scan
+  script:
+    - docker system prune -f || true
+    - docker build -t ${IMAGE_NAME} ${APP_DIR}
+
+# =============================================================================
+# 6) Push to Amazon ECR
+# =============================================================================
+# WHAT: Tags the local image as ACCOUNT.dkr.ecr…/repo:PIPELINE_IID and pushes.
+# WHY CI_PIPELINE_IID as the tag?
+#   "latest" is mutable — you never know what digest it points to tomorrow.
+#   Pipeline IID is unique per pipeline → immutable tags (C5).
+# ARTIFACT dotenv: later jobs read FULL_IMAGE without recomputing the URI.
+frontend:ecr-push:
+  extends:
+    - .frontend_rules
+    - .oidc_aws_app
+  stage: ecr-push
+  tags: [devsecops]
+  allow_failure: false
+  needs: ["frontend:docker-build"]
+  script:
+    - |
+      set -euo pipefail
+      REPOSITORY_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      FULL_IMAGE="${REPOSITORY_URI}/${IMAGE_NAME}:${CI_PIPELINE_IID}"
+      # Docker login to ECR using a short-lived password from AWS
+      aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" \
+        | docker login --username AWS --password-stdin "${REPOSITORY_URI}"
+      docker tag "${IMAGE_NAME}" "${FULL_IMAGE}"
+      docker push "${FULL_IMAGE}"
+      echo "FULL_IMAGE=${FULL_IMAGE}" > frontend.env
+      # Free disk on the runner after a successful push
+      docker rmi "${IMAGE_NAME}" "${FULL_IMAGE}" || true
+  artifacts:
+    reports:
+      dotenv: frontend.env
+    expire_in: 7 days
+
+# =============================================================================
+# 7a) Trivy image scan (after push)
+# =============================================================================
+# WHAT: Pulls/scans the image that is actually in ECR (OS packages + app deps).
+# WHY after push (not only fs scan)?
+#   The Dockerfile base image (node:18-alpine) can introduce OS CVEs the
+#   source-tree scan never sees. Scan what you ship.
+frontend:trivy-image-scan:
+  extends:
+    - .frontend_rules
+    - .oidc_aws_app
+  stage: trivy-image-scan
+  tags: [devsecops]
+  allow_failure: false
+  needs: ["frontend:ecr-push"]
+  cache:
+    - key: "trivy-db-${TRIVY_VERSION}"
+      paths:
+        - .ci-cache/trivy/
+      policy: pull-push
+  script:
+    - |
+      set -euo pipefail
+      # WHY docker run aquasec/trivy (not curl|tar binary)?
+      #   Alpine job image tar often gets HTML/short reads from GitHub → "invalid magic".
+      # WHY tee (not -v CI_PROJECT_DIR:/out -o /out/...)?
+      #   With the host Docker socket, bind mounts use HOST paths. Writing -o into a
+      #   mounted /out often never appears in the job workspace → empty artifacts and
+      #   a silent CVE table. tee keeps the report in-job and in the log.
+      mkdir -p "${TRIVY_CACHE_DIR}"
+      REPOSITORY_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      FULL_IMAGE="${REPOSITORY_URI}/${IMAGE_NAME}:${CI_PIPELINE_IID}"
+      aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" \
+        | docker login --username AWS --password-stdin "${REPOSITORY_URI}"
+      docker pull "${FULL_IMAGE}"
+      docker run --rm \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -v "${TRIVY_CACHE_DIR}:/root/.cache/trivy" \
+        "aquasec/trivy:${TRIVY_VERSION}" image \
+        --scanners vuln \
+        --exit-code 1 --severity CRITICAL,HIGH --ignore-unfixed \
+        --format table "${FULL_IMAGE}" | tee trivy-image-frontend.txt
+  artifacts:
+    when: always
+    paths:
+      - trivy-image-frontend.txt
+    expire_in: 7 days
+
+# =============================================================================
+# 7b) Cosign keyless sign
+# =============================================================================
+# WHAT: Attaches a signature to the ECR image using Sigstore (Fulcio) + GitLab OIDC.
+# WHY keyless?
+#   No Cosign private key stored in GitLab variables to leak.
+#   Kyverno in the cluster can later require "only admit signed images" (C5/C10).
+# WHY SIGSTORE_ID_TOKEN (aud: sigstore) instead of AWS_JWT?
+#   Fulcio rejects the AWS audience JWT with "error processing the identity token".
+frontend:image-sign:
+  extends:
+    - .frontend_rules
+    - .oidc_aws_app
+  stage: image-sign
+  tags: [devsecops]
+  allow_failure: false
+  needs: ["frontend:ecr-push"]
+  cache:
+    key: "ci-tools-bin-${COSIGN_VERSION}-${TRIVY_VERSION}"
+    paths:
+      - .ci-cache/bin/
+    policy: pull-push
+  script:
+    - |
+      set -euo pipefail
+      mkdir -p "${CI_TOOLS_DIR}"
+      if [ ! -x "${CI_TOOLS_DIR}/cosign" ]; then
+        echo "Downloading cosign ${COSIGN_VERSION} (cache miss)..."
+        curl -fsSL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" \
+          -o "${CI_TOOLS_DIR}/cosign"
+        chmod +x "${CI_TOOLS_DIR}/cosign"
+        # Sanity: HTML error pages are tiny; real cosign binary is >10MB
+        [ "$(wc -c < "${CI_TOOLS_DIR}/cosign")" -gt 10000000 ] \
+          || { echo "cosign download looks too small (not a real binary)"; exit 1; }
+      else
+        echo "Using cached cosign at ${CI_TOOLS_DIR}/cosign"
+      fi
+      REPOSITORY_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      FULL_IMAGE="${REPOSITORY_URI}/${IMAGE_NAME}:${CI_PIPELINE_IID}"
+      # Cosign talks to the registry to attach the signature → must be logged in
+      aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" \
+        | docker login --username AWS --password-stdin "${REPOSITORY_URI}"
+      "${CI_TOOLS_DIR}/cosign" sign --yes --identity-token="${SIGSTORE_ID_TOKEN}" "${FULL_IMAGE}"
+
+# =============================================================================
+# 8) Update gitops manifests
+# =============================================================================
+# WHAT: Checks out the `gitops` branch, rewrites the Deployment image, pushes.
+# WHY a separate branch?
+#   `main` = code + CI. `gitops` = desired cluster state ArgoCD watches (C1).
+#   Keeps app PRs clean and gives a clear deploy audit trail.
+# WHY [skip ci] in the commit message?
+#   Without it, the gitops push would start ANOTHER pipeline → infinite loop (C6).
+frontend:update-manifest:
+  extends: .frontend_rules
+  image:
+    name: alpine/git:v2.47.2
+    entrypoint: [""]
+  stage: update-manifest
+  tags: [devsecops]
+  allow_failure: false
+  needs: ["frontend:image-sign", "frontend:trivy-image-scan"]
+  script:
+    - |
+      set -euo pipefail
+      REPOSITORY_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      FULL_IMAGE="${REPOSITORY_URI}/${IMAGE_NAME}:${CI_PIPELINE_IID}"
+      git config user.email "ci@gitlab.com"
+      git config user.name "GitLab CI"
+      # Create gitops on first run if it does not exist yet
+      git fetch origin gitops || git checkout -b gitops
+      git checkout gitops
+      # Replace whatever frontend image tag is currently in the Deployment
+      sed -i -E "s|(image:\\s*).*frontend:[^[:space:]]+|\\1${FULL_IMAGE}|" ${MANIFEST_DIR}/deployment.yaml
+      # Fallback for brand-new manifests that still have the placeholder
+      sed -i "s|IMAGE_TAG_PLACEHOLDER|${CI_PIPELINE_IID}|g" ${MANIFEST_DIR}/deployment.yaml || true
+      git add ${MANIFEST_DIR}/deployment.yaml
+      # Idempotent: if the tag did not change, exit 0 instead of failing the commit
+      git diff --cached --quiet && echo "No manifest changes" && exit 0
+      git commit -m "Update frontend deployment image to ${CI_PIPELINE_IID} [skip ci]"
+      # GITLAB_TOKEN is a project access token with write_repository scope
+      git push "https://oauth2:${GITLAB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" HEAD:gitops

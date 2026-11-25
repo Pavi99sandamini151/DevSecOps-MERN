@@ -1,0 +1,126 @@
+# Observability stack — Argo CD multi-source Helm apps + CRDs
+# Apply after kube-prometheus-stack is installed (ServiceMonitor CRDs).
+# Access Jaeger via SSM: kubectl -n monitoring port-forward svc/jaeger 16686:16686
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: observability-crds
+  namespace: argocd
+spec:
+  project: cluster-tools
+  source:
+    repoURL: https://gitlab.com/YOUR_GITLAB_NAMESPACE/devsecops-mern-eks.git
+    targetRevision: gitops
+    path: k8s/observability
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: three-tier
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: loki
+  namespace: argocd
+spec:
+  project: cluster-tools
+  sources:
+    - repoURL: https://grafana.github.io/helm-charts
+      chart: loki
+      targetRevision: 6.16.0
+      helm:
+        releaseName: loki
+        valueFiles:
+          - $values/helm-values/loki-values.yaml
+    - repoURL: https://gitlab.com/YOUR_GITLAB_NAMESPACE/devsecops-mern-eks.git
+      targetRevision: gitops
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: fluent-bit
+  namespace: argocd
+spec:
+  project: cluster-tools
+  sources:
+    - repoURL: https://fluent.github.io/helm-charts
+      chart: fluent-bit
+      targetRevision: 0.47.9
+      helm:
+        releaseName: fluent-bit
+        valueFiles:
+          - $values/helm-values/fluent-bit-values.yaml
+    - repoURL: https://gitlab.com/YOUR_GITLAB_NAMESPACE/devsecops-mern-eks.git
+      targetRevision: gitops
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: jaeger
+  namespace: argocd
+spec:
+  project: cluster-tools
+  sources:
+    - repoURL: https://jaegertracing.github.io/helm-charts
+      chart: jaeger
+      targetRevision: 3.3.5
+      helm:
+        releaseName: jaeger
+        valueFiles:
+          - $values/helm-values/jaeger-values.yaml
+    - repoURL: https://gitlab.com/YOUR_GITLAB_NAMESPACE/devsecops-mern-eks.git
+      targetRevision: gitops
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: otel-collector
+  namespace: argocd
+spec:
+  project: cluster-tools
+  sources:
+    - repoURL: https://open-telemetry.github.io/opentelemetry-helm-charts
+      chart: opentelemetry-collector
+      targetRevision: 0.109.0
+      helm:
+        releaseName: otel-collector
+        valueFiles:
+          - $values/helm-values/otel-collector-values.yaml
+    - repoURL: https://gitlab.com/YOUR_GITLAB_NAMESPACE/devsecops-mern-eks.git
+      targetRevision: gitops
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true

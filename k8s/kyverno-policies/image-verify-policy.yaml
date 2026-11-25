@@ -1,0 +1,41 @@
+# Verify Cosign keyless signatures before admitting pods (C5 / C10)
+# Cosign keyless identity for https://gitlab.com/YOUR_GITLAB_NAMESPACE/devsecops-mern-eks
+#
+# WHY imagePullSecrets?
+#   Kyverno itself must pull the image manifest + .sig from private ECR during
+#   admission. Node IAM does not apply to that call → 401 without credentials.
+#   Create the secret with: ./scripts/kyverno-ecr-access.sh (also sets IRSA).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signatures
+spec:
+  validationFailureAction: Enforce
+  background: false
+  webhookTimeoutSeconds: 30
+  rules:
+    - name: verify-frontend-backend-cosign
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - three-tier
+      verifyImages:
+        - imageReferences:
+            - "*.dkr.ecr.*.amazonaws.com/frontend:*"
+            - "*.dkr.ecr.*.amazonaws.com/backend:*"
+          # Secret must live in the kyverno namespace (not three-tier)
+          imagePullSecrets:
+            - ecr-pull-secret
+          attestors:
+            - entries:
+                - keyless:
+                    issuer: "https://gitlab.com"
+                    subject: "https://gitlab.com/YOUR_GITLAB_NAMESPACE/devsecops-mern-eks//.gitlab-ci.yml@refs/heads/main"
+                    rekor:
+                      url: https://rekor.sigstore.dev
+          mutateDigest: true
+          verifyDigest: true
+          required: true

@@ -1,0 +1,17 @@
+server:
+  service:
+    type: ClusterIP
+  ingress:
+    enabled: false  # managed via k8s/argocd-ingress.yaml
+  extraArgs:
+    - --insecure  # TLS terminated at ALB
+
+configs:
+  params:
+    server.insecure: true
+
+dex:
+  enabled: false
+
+notifications:
+  enabled: false

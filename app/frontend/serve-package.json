@@ -1,0 +1,12 @@
+{
+  "name": "frontend-runtime",
+  "private": true,
+  "dependencies": {
+    "serve": "14.2.7"
+  },
+  "overrides": {
+    "brace-expansion": "2.1.6",
+    "compression": "1.8.2",
+    "picomatch": "4.0.4"
+  }
+}

@@ -1,0 +1,156 @@
+# ArgoCD Applications — replace GITLAB_REPO_URL and ensure gitops branch exists (G8)
+# All apps: prune=false, selfHeal=true (sec-argocd-prune)
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: serviceaccounts
+  namespace: argocd
+spec:
+  project: three-tier-app
+  source:
+    repoURL: https://gitlab.com/YOUR_GITLAB_NAMESPACE/devsecops-mern-eks.git
+    targetRevision: gitops
+    path: k8s/serviceaccounts
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: three-tier
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: network-policies
+  namespace: argocd
+spec:
+  project: three-tier-app
+  source:
+    repoURL: https://gitlab.com/YOUR_GITLAB_NAMESPACE/devsecops-mern-eks.git
+    targetRevision: gitops
+    path: k8s/network-policies
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: three-tier
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: database
+  namespace: argocd
+spec:
+  project: three-tier-app
+  source:
+    repoURL: https://gitlab.com/YOUR_GITLAB_NAMESPACE/devsecops-mern-eks.git
+    targetRevision: gitops
+    path: k8s/database
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: three-tier
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: backend
+  namespace: argocd
+spec:
+  project: three-tier-app
+  source:
+    repoURL: https://gitlab.com/YOUR_GITLAB_NAMESPACE/devsecops-mern-eks.git
+    targetRevision: gitops
+    path: k8s/backend
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: three-tier
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: frontend
+  namespace: argocd
+spec:
+  project: three-tier-app
+  source:
+    repoURL: https://gitlab.com/YOUR_GITLAB_NAMESPACE/devsecops-mern-eks.git
+    targetRevision: gitops
+    path: k8s/frontend
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: three-tier
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ingress
+  namespace: argocd
+spec:
+  project: three-tier-app
+  source:
+    repoURL: https://gitlab.com/YOUR_GITLAB_NAMESPACE/devsecops-mern-eks.git
+    targetRevision: gitops
+    path: k8s
+    directory:
+      include: "ingress.yaml"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: three-tier
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: pdb
+  namespace: argocd
+spec:
+  project: three-tier-app
+  source:
+    repoURL: https://gitlab.com/YOUR_GITLAB_NAMESPACE/devsecops-mern-eks.git
+    targetRevision: gitops
+    path: k8s/pdb
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: three-tier
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kyverno-policies
+  namespace: argocd
+spec:
+  project: cluster-tools
+  source:
+    repoURL: https://gitlab.com/YOUR_GITLAB_NAMESPACE/devsecops-mern-eks.git
+    targetRevision: gitops
+    path: k8s/kyverno-policies
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kyverno
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true

@@ -1,0 +1,216 @@
+# =============================================================================
+# Terraform pipeline — infra/eks only
+# =============================================================================
+# BEGINNER MAP
+#   Terraform turns HCL files in infra/eks/ into real AWS resources (VPC, EKS…).
+#   We NEVER auto-apply on every git push — one bad apply can delete a cluster.
+#
+#   Happy path when you change infra:
+#     1) You click Play on tf-init   → downloads providers, opens the S3 backend
+#     2) tf-validate runs alone     → "is the syntax valid?"
+#     3) tf-plan runs alone         → writes a plan file you can review
+#     4) You click Play on tf-apply → applies THAT saved plan (no surprises)
+#
+# WHY app pushes must not wait on Terraform
+#   Older design: a always-present manual tf-init sat in stage "init".
+#   GitLab waits for earlier stages before later ones → every frontend push
+#   sat blocked until someone clicked Play on Terraform. Bad DX.
+#   Fix: only CREATE infra jobs when infra/** changes (or RUN_INFRA=true).
+#   Empty stages are skipped → app CI starts immediately (C8).
+#
+# PRACTICE
+#   - C2/C3: assume AWS_INFRA_ROLE_ARN via GitLab OIDC (no static AWS keys).
+#   - C7: manual gates for init/apply/destroy; plan/validate auto after init.
+#   - C8: path rules + RUN_INFRA=true for explicit "Run pipeline" from the UI.
+# IMAGE
+#   - ubuntu:24.04 + official HashiCorp/AWS binaries.
+#   - hashicorp/terraform Alpine breaks aws-cli (expat) and its ENTRYPOINT
+#     breaks GitLab's shell wrapper — so we avoid that image on purpose.
+# =============================================================================
+
+variables:
+  # backend.tf uses use_lockfile → require Terraform >= 1.10
+  TF_VERSION: "1.10.5"
+
+# ---------------------------------------------------------------------------
+# Rule templates — reused by every tf-* job via `extends`
+# ---------------------------------------------------------------------------
+# Auto jobs (validate/plan): only when infra changed or someone set RUN_INFRA
+.infra_rules:
+  rules:
+    # Explicit UI trigger: CI/CD → Run pipeline → add variable RUN_INFRA=true
+    - if: $CI_PIPELINE_SOURCE == "web" && $RUN_INFRA == "true"
+    # Normal push to main, but ONLY if Terraform / this CI file changed
+    - if: $CI_COMMIT_BRANCH == "main"
+      changes:
+        - infra/**/*
+        - ci/infra.gitlab-ci.yml
+    # Otherwise: do not create the job at all
+    - when: never
+
+# Manual jobs (init/apply/destroy): same gate, but human must click Play
+.infra_manual_rules:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web" && $RUN_INFRA == "true"
+      when: manual
+    - if: $CI_COMMIT_BRANCH == "main"
+      changes:
+        - infra/**/*
+        - ci/infra.gitlab-ci.yml
+      when: manual
+    - when: never
+
+# ---------------------------------------------------------------------------
+# Shared bootstrap for every tf-* job
+# ---------------------------------------------------------------------------
+# WHAT this does before your script: runs
+#   1) Install curl/unzip/jq (tiny OS packages — always needed)
+#   2) Download terraform + aws CLI into .ci-cache IF missing
+#   3) Exchange GitLab's short-lived JWT for temporary AWS credentials (OIDC)
+.oidc_aws_infra:
+  image:
+    name: ubuntu:24.04
+    # REQUIRED: Ubuntu's default entrypoint would break how GitLab injects scripts
+    entrypoint: [""]
+  tags: [devsecops] # dedicated runner only — never shared runners for infra
+  # Ask GitLab to mint a JWT for this job; AWS trusts that JWT via OIDC provider
+  id_tokens:
+    AWS_JWT:
+      aud: https://gitlab.com # must match the audience configured in AWS IAM
+  # Cache terraform + awscli under .ci-cache so each job does not re-download
+  cache:
+    key: "infra-tools-${TF_VERSION}"
+    paths:
+      - .ci-cache/infra-tools/
+    policy: pull-push # restore old cache, then save anything new at job end
+  before_script:
+    - |
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -qq
+      apt-get install -y -qq curl unzip jq ca-certificates >/dev/null
+      mkdir -p "${INFRA_TOOLS_DIR}/bin"
+      export PATH="${INFRA_TOOLS_DIR}/bin:${PATH}"
+
+      # Download-on-miss: first pipeline fills cache; later jobs reuse binaries
+      if [ ! -x "${INFRA_TOOLS_DIR}/bin/terraform" ]; then
+        echo "Downloading terraform ${TF_VERSION} (cache miss)..."
+        curl -fsSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip" -o /tmp/tf.zip
+        unzip -qo /tmp/tf.zip -d "${INFRA_TOOLS_DIR}/bin"
+        rm -f /tmp/tf.zip
+      else
+        echo "Using cached terraform at ${INFRA_TOOLS_DIR}/bin/terraform"
+      fi
+
+      if [ ! -x "${INFRA_TOOLS_DIR}/bin/aws" ]; then
+        echo "Downloading AWS CLI v2 (cache miss)..."
+        curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+        unzip -qo /tmp/awscliv2.zip -d /tmp
+        /tmp/aws/install -i "${INFRA_TOOLS_DIR}/aws-cli" -b "${INFRA_TOOLS_DIR}/bin" >/dev/null
+        rm -rf /tmp/aws /tmp/awscliv2.zip
+      else
+        echo "Using cached AWS CLI at ${INFRA_TOOLS_DIR}/bin/aws"
+      fi
+
+      # C3: exchange GitLab JWT for temporary AWS creds (no long-lived keys in GitLab)
+      # Think of it like a hotel keycard that expires in 1 hour.
+      CREDS=$(aws sts assume-role-with-web-identity \
+        --role-arn "${AWS_INFRA_ROLE_ARN}" \
+        --role-session-name "gitlab-infra-${CI_JOB_ID}" \
+        --web-identity-token "${AWS_JWT}" \
+        --duration-seconds 3600 \
+        --query 'Credentials' \
+        --output json)
+      export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r .AccessKeyId)
+      export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r .SecretAccessKey)
+      export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .SessionToken)
+      # Prove to the log who we became (helps debug wrong role / wrong account)
+      aws sts get-caller-identity
+
+# ---------------------------------------------------------------------------
+# tf-init — MANUAL
+# ---------------------------------------------------------------------------
+# WHAT: Downloads providers and connects to the remote state backend (S3).
+# WHY manual: Starting the infra chain is an operator decision, not automatic.
+# ARTIFACTS: .terraform/ is passed to later jobs so they do not re-init.
+tf-init:
+  extends:
+    - .oidc_aws_infra
+    - .infra_manual_rules
+  stage: init
+  script:
+    - terraform -chdir=infra/eks init -input=false
+  artifacts:
+    paths:
+      - infra/eks/.terraform/
+      - infra/eks/.terraform.lock.hcl
+    expire_in: 7 days
+
+# ---------------------------------------------------------------------------
+# tf-validate — AUTO after init
+# ---------------------------------------------------------------------------
+# WHAT: Checks HCL syntax and that resources match provider schemas.
+# WHY: Cheap fail-fast before we spend time planning against AWS.
+tf-validate:
+  extends:
+    - .oidc_aws_infra
+    - .infra_rules
+  stage: validate
+  needs: [tf-init] # DAG edge: do not rely on stage order alone
+  script:
+    - terraform -chdir=infra/eks validate
+  # needs is not transitive — re-publish init artifacts so plan can download them
+  artifacts:
+    paths:
+      - infra/eks/.terraform/
+      - infra/eks/.terraform.lock.hcl
+    expire_in: 7 days
+
+# ---------------------------------------------------------------------------
+# tf-plan — AUTO after validate
+# ---------------------------------------------------------------------------
+# WHAT: Talks to AWS, computes the diff, writes it to file `tfplan`.
+# WHY artifact: apply MUST use this exact plan so "what you reviewed = what runs".
+tf-plan:
+  extends:
+    - .oidc_aws_infra
+    - .infra_rules
+  stage: plan
+  needs: [tf-validate]
+  script:
+    - terraform -chdir=infra/eks plan -var-file=terraform.tfvars -out=tfplan -input=false
+  artifacts:
+    paths:
+      - infra/eks/tfplan
+      - infra/eks/.terraform/
+      - infra/eks/.terraform.lock.hcl
+    expire_in: 1 day
+
+# ---------------------------------------------------------------------------
+# tf-apply — MANUAL (C7)
+# ---------------------------------------------------------------------------
+# WHAT: Applies the saved plan file — creates/changes/destroys AWS resources.
+# WHY never auto: accidental apply on a typo can wipe production networking.
+tf-apply:
+  extends:
+    - .oidc_aws_infra
+    - .infra_manual_rules
+  stage: apply
+  needs: [tf-plan]
+  timeout: 30 minutes # EKS + node groups can be slow
+  script:
+    - terraform -chdir=infra/eks apply -input=false tfplan
+
+# ---------------------------------------------------------------------------
+# tf-destroy — MANUAL (C7)
+# ---------------------------------------------------------------------------
+# WHAT: Tears down everything in this Terraform root.
+# WHY separate job: destroy should never be chained accidentally after apply.
+tf-destroy:
+  extends:
+    - .oidc_aws_infra
+    - .infra_manual_rules
+  stage: destroy
+  timeout: 30 minutes
+  script:
+    - terraform -chdir=infra/eks destroy -var-file=terraform.tfvars -auto-approve -input=false

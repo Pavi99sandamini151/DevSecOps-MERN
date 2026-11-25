@@ -1,0 +1,55 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mainlb
+  namespace: three-tier
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    # Paste: terraform -chdir=infra/dns output -raw acm_certificate_arn
+    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:us-east-1:ACCOUNT_ID:certificate/REPLACE_ACM_CERT_ARN"
+    # Replace with Terraform output waf_web_acl_arn (sec-waf)
+    alb.ingress.kubernetes.io/wafv2-acl-arn: "arn:aws:wafv2:us-east-1:ACCOUNT_ID:regional/webacl/REPLACE_WAF_ACL"
+spec:
+  ingressClassName: alb
+  rules:
+    - host: devops.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 3500
+          - path: /healthz
+            pathType: Exact
+            backend:
+              service:
+                name: api
+                port:
+                  number: 3500
+          - path: /ready
+            pathType: Exact
+            backend:
+              service:
+                name: api
+                port:
+                  number: 3500
+          - path: /started
+            pathType: Exact
+            backend:
+              service:
+                name: api
+                port:
+                  number: 3500
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 3000

@@ -1,0 +1,78 @@
+# OpenTelemetry Collector — traces to Jaeger only (app RED metrics via prom-client)
+mode: deployment
+
+fullnameOverride: otel-collector
+
+image:
+  repository: otel/opentelemetry-collector-contrib
+  tag: "0.114.0"
+  pullPolicy: IfNotPresent
+
+command:
+  name: otelcol-contrib
+
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+# No hostPort on EKS
+ports:
+  otlp:
+    enabled: true
+    containerPort: 4317
+    servicePort: 4317
+    protocol: TCP
+    appProtocol: grpc
+  otlp-http:
+    enabled: true
+    containerPort: 4318
+    servicePort: 4318
+    protocol: TCP
+  metrics:
+    enabled: false
+  jaeger-compact:
+    enabled: false
+  jaeger-thrift:
+    enabled: false
+  jaeger-grpc:
+    enabled: false
+  zipkin:
+    enabled: false
+
+service:
+  type: ClusterIP
+
+config:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+  processors:
+    batch: {}
+    memory_limiter:
+      check_interval: 1s
+      limit_mib: 200
+  exporters:
+    otlp/jaeger:
+      # all-in-one Jaeger release name "jaeger" exposes OTLP on the main Service
+      endpoint: jaeger.monitoring.svc.cluster.local:4317
+      tls:
+        insecure: true
+    debug:
+      verbosity: basic
+  service:
+    pipelines:
+      traces:
+        receivers: [otlp]
+        processors: [memory_limiter, batch]
+        exporters: [otlp/jaeger, debug]
+    # No metrics pipeline — avoid duplicating prom-client series

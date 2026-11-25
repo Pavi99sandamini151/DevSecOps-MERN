@@ -1,0 +1,391 @@
+# =============================================================================
+# Backend DevSecOps pipeline (Node / Express API image)
+# =============================================================================
+# BEGINNER MAP — same chain as frontend, different folders / ECR repo / Sonar key.
+#   Sonar → quality gate → OWASP + npm audit → Trivy fs → docker build →
+#   ECR push → Trivy image + Cosign → update gitops Deployment.
+#
+# WHY a separate file instead of one "app" pipeline?
+#   Path filters: changing only the API must not rebuild the React image (C8).
+#   Also keeps job names clear in the GitLab UI (backend:* vs frontend:*).
+#
+# CRITICAL: job variables MUST live under .backend_rules — NOT at file top-level.
+#   GitLab merges include-level `variables:`; last include wins. If APP_DIR were
+#   top-level here, it would overwrite frontend's APP_DIR and scanners would
+#   scan the wrong tree.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Shared AWS login for ECR / Cosign (app role — least privilege, C2/C3)
+# ---------------------------------------------------------------------------
+.oidc_aws_app_backend:
+  image:
+    name: docker:27
+    entrypoint: [""]
+  tags: [devsecops]
+  id_tokens:
+    # AWS STS trust policy audience (must match infra/oidc)
+    AWS_JWT:
+      aud: https://gitlab.com
+    # Sigstore Fulcio audience — MUST be "sigstore", not the AWS JWT (C5)
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  before_script:
+    - |
+      set -euo pipefail
+      apk add --no-cache aws-cli jq curl >/dev/null
+      CREDS=$(aws sts assume-role-with-web-identity \
+        --role-arn "${AWS_ROLE_ARN}" \
+        --role-session-name "gitlab-app-${CI_JOB_ID}" \
+        --web-identity-token "${AWS_JWT}" \
+        --duration-seconds 3600 \
+        --query 'Credentials' \
+        --output json)
+      export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r .AccessKeyId)
+      export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r .SecretAccessKey)
+      export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r .SessionToken)
+
+# ---------------------------------------------------------------------------
+# Per-job defaults for the API
+# ---------------------------------------------------------------------------
+.backend_rules:
+  variables:
+    SONAR_PROJECT_KEY: "three-tier-backend"
+    APP_DIR: "app/backend"
+    MANIFEST_DIR: "k8s/backend"
+    IMAGE_NAME: "$ECR_REPO_BACKEND"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      changes:
+        - app/backend/**/*
+        - ci/backend.gitlab-ci.yml
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+# =============================================================================
+# 1) SonarQube analysis
+# =============================================================================
+# Same pattern as frontend: ensure host Sonar is UP, scan via --network host.
+# See ci/frontend.gitlab-ci.yml for the longer "why host network / why /tmp" notes.
+backend:sonarqube-analysis:
+  extends: .backend_rules
+  image:
+    name: docker:27
+    entrypoint: [""]
+  stage: sonarqube-analysis
+  tags: [devsecops]
+  allow_failure: false
+  needs: []
+  variables:
+    SONAR_URL: "http://127.0.0.1:9000"
+    SONAR_SCANNER_IMAGE: "sonarsource/sonar-scanner-cli:11.1"
+  script:
+    - |
+      set -euo pipefail
+      if ! docker ps --format '{{.Names}}' | grep -qx sonarqube; then
+        echo "Starting SonarQube container..."
+        docker start sonarqube 2>/dev/null || docker run -d --name sonarqube \
+          --restart unless-stopped \
+          -p 9000:9000 \
+          -v sonarqube_data:/opt/sonarqube/data \
+          -v sonarqube_logs:/opt/sonarqube/logs \
+          -v sonarqube_extensions:/opt/sonarqube/extensions \
+          sonarqube:lts-community
+      fi
+      echo "Waiting for SonarQube at ${SONAR_URL}..."
+      i=0
+      until docker run --rm --network host curlimages/curl:8.5.0 \
+          -sf "${SONAR_URL}/api/system/status" | grep -q '"status":"UP"'; do
+        i=$((i + 1))
+        [ "$i" -ge 60 ] && { echo "SonarQube did not become UP in time"; docker logs sonarqube 2>&1 | tail -40; exit 1; }
+        sleep 5
+      done
+      echo "SonarQube is UP"
+      docker run --rm --network host \
+        -u root \
+        -e SONAR_USER_HOME=/tmp/.sonar \
+        -v "${CI_PROJECT_DIR}/${APP_DIR}:/usr/src:ro" \
+        -w /usr/src \
+        --entrypoint sonar-scanner \
+        "${SONAR_SCANNER_IMAGE}" \
+        -Dsonar.projectName=${SONAR_PROJECT_KEY} \
+        -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+        -Dsonar.sources=. \
+        -Dsonar.working.directory=/tmp/.scannerwork \
+        -Dsonar.host.url=${SONAR_URL} \
+        -Dsonar.login=${SONAR_TOKEN}
+
+# =============================================================================
+# 2) Quality gate poll
+# =============================================================================
+backend:quality-gate:
+  extends: .backend_rules
+  image:
+    name: docker:27
+    entrypoint: [""]
+  stage: quality-gate
+  tags: [devsecops]
+  allow_failure: false
+  needs: ["backend:sonarqube-analysis"]
+  variables:
+    SONAR_URL: "http://127.0.0.1:9000"
+  script:
+    - |
+      set -euo pipefail
+      ATTEMPTS=0
+      STATUS="NONE"
+      until [ "$ATTEMPTS" -ge 20 ]; do
+        STATUS=$(docker run --rm --network host --entrypoint sh badouralix/curl-jq -c \
+          "curl -s -u '${SONAR_TOKEN}:' \
+            '${SONAR_URL}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}' \
+            | jq -r '.projectStatus.status'")
+        echo "Quality gate status: ${STATUS} (attempt ${ATTEMPTS})"
+        [ "$STATUS" = "OK" ] && break
+        [ "$STATUS" = "ERROR" ] && echo "Quality gate FAILED" && exit 1
+        ATTEMPTS=$((ATTEMPTS + 1))
+        sleep 10
+      done
+      [ "$STATUS" = "OK" ] || { echo "Quality gate timed out with status=${STATUS}"; exit 1; }
+
+# =============================================================================
+# 3) OWASP Dependency-Check + npm audit
+# =============================================================================
+# Backend ships its runtime deps in the image (no CRA multi-stage split), so we
+# run a full `npm audit --audit-level=high` (includes everything package.json needs).
+backend:owasp-dependency-check:
+  extends: .backend_rules
+  image:
+    name: node:18-bookworm
+    entrypoint: [""]
+  stage: owasp-dependency-check
+  tags: [devsecops]
+  allow_failure: false
+  needs: []
+  timeout: 60 minutes
+  variables:
+    DC_VERSION: "12.1.0"
+    DC_HOME: "${CI_PROJECT_DIR}/.ci-cache/owasp/dependency-check"
+    DC_DATA: "${CI_PROJECT_DIR}/.ci-cache/owasp/data"
+  cache:
+    key: "owasp-dc-12.1.0"
+    paths:
+      - .ci-cache/owasp/
+    policy: pull-push
+  script:
+    - |
+      set -euo pipefail
+      apt-get update -qq
+      apt-get install -y -qq default-jre-headless unzip wget >/dev/null
+      mkdir -p "${DC_DATA}"
+      if [ ! -x "${DC_HOME}/bin/dependency-check.sh" ]; then
+        echo "Downloading OWASP Dependency-Check ${DC_VERSION} (cache miss)..."
+        wget -q "https://github.com/jeremylong/DependencyCheck/releases/download/v${DC_VERSION}/dependency-check-${DC_VERSION}-release.zip" -O /tmp/dc.zip
+        unzip -qo /tmp/dc.zip -d "${CI_PROJECT_DIR}/.ci-cache/owasp"
+        rm -f /tmp/dc.zip
+      else
+        echo "Using cached OWASP Dependency-Check at ${DC_HOME}"
+      fi
+    - cd ${APP_DIR}
+    - |
+      # Reuse NVD DB when present (avoids multi-hour re-download)
+      DC_EXTRA=()
+      if [ -f "${DC_DATA}/odc.mv.db" ] || ls "${DC_DATA}"/*.h2.db >/dev/null 2>&1; then
+        echo "Using cached NVD data ( --noupdate )"
+        DC_EXTRA+=(--noupdate)
+      fi
+      "${DC_HOME}/bin/dependency-check.sh" \
+        --project "${SONAR_PROJECT_KEY}" \
+        --scan . \
+        --format HTML --format JSON \
+        --out . \
+        --data "${DC_DATA}" \
+        --nvdValidForHours 168 \
+        --disableOssIndex \
+        --disableKnownExploited \
+        "${DC_EXTRA[@]}"
+    - npm audit --audit-level=high
+  artifacts:
+    when: always
+    paths:
+      - ${APP_DIR}/dependency-check-report.html
+      - ${APP_DIR}/dependency-check-report.json
+    expire_in: 7 days
+
+# =============================================================================
+# 4) Trivy filesystem scan
+# =============================================================================
+backend:trivy-file-scan:
+  extends: .backend_rules
+  image:
+    name: aquasec/trivy:0.57.1
+    entrypoint: [""]
+  stage: trivy-file-scan
+  tags: [devsecops]
+  allow_failure: false
+  needs: []
+  cache:
+    key: "trivy-db-${TRIVY_VERSION}"
+    paths:
+      - .ci-cache/trivy/
+    policy: pull-push
+  script:
+    - mkdir -p "${TRIVY_CACHE_DIR}"
+    - |
+      trivy fs --cache-dir "${TRIVY_CACHE_DIR}" \
+        --scanners vuln \
+        --exit-code 1 --severity CRITICAL,HIGH --ignore-unfixed \
+        --format table -o trivy-fs-backend.txt "${APP_DIR}"
+  artifacts:
+    when: always
+    paths:
+      - trivy-fs-backend.txt
+    expire_in: 7 days
+
+# =============================================================================
+# 5) Docker build (only after quality + dependency + fs scans pass)
+# =============================================================================
+backend:docker-build:
+  extends: .backend_rules
+  image:
+    name: docker:27
+    entrypoint: [""]
+  stage: docker-build
+  tags: [devsecops]
+  allow_failure: false
+  needs:
+    - backend:quality-gate
+    - backend:owasp-dependency-check
+    - backend:trivy-file-scan
+  script:
+    - docker system prune -f || true
+    - docker build -t ${IMAGE_NAME} ${APP_DIR}
+
+# =============================================================================
+# 6) Push immutable tag to ECR (C5)
+# =============================================================================
+backend:ecr-push:
+  extends:
+    - .backend_rules
+    - .oidc_aws_app_backend
+  stage: ecr-push
+  tags: [devsecops]
+  allow_failure: false
+  needs: ["backend:docker-build"]
+  script:
+    - |
+      set -euo pipefail
+      REPOSITORY_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      FULL_IMAGE="${REPOSITORY_URI}/${IMAGE_NAME}:${CI_PIPELINE_IID}"
+      aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" \
+        | docker login --username AWS --password-stdin "${REPOSITORY_URI}"
+      docker tag "${IMAGE_NAME}" "${FULL_IMAGE}"
+      docker push "${FULL_IMAGE}"
+      echo "FULL_IMAGE=${FULL_IMAGE}" > backend.env
+      docker rmi "${IMAGE_NAME}" "${FULL_IMAGE}" || true
+  artifacts:
+    reports:
+      dotenv: backend.env
+    expire_in: 7 days
+
+# =============================================================================
+# 7a) Trivy image scan — scan what we actually shipped
+# =============================================================================
+backend:trivy-image-scan:
+  extends:
+    - .backend_rules
+    - .oidc_aws_app_backend
+  stage: trivy-image-scan
+  tags: [devsecops]
+  allow_failure: false
+  needs: ["backend:ecr-push"]
+  cache:
+    - key: "trivy-db-${TRIVY_VERSION}"
+      paths:
+        - .ci-cache/trivy/
+      policy: pull-push
+  script:
+    - |
+      set -euo pipefail
+      # Official Trivy image + tee → report lands in job workspace (socket mounts are host paths)
+      mkdir -p "${TRIVY_CACHE_DIR}"
+      REPOSITORY_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      FULL_IMAGE="${REPOSITORY_URI}/${IMAGE_NAME}:${CI_PIPELINE_IID}"
+      aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" \
+        | docker login --username AWS --password-stdin "${REPOSITORY_URI}"
+      docker pull "${FULL_IMAGE}"
+      docker run --rm \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -v "${TRIVY_CACHE_DIR}:/root/.cache/trivy" \
+        "aquasec/trivy:${TRIVY_VERSION}" image \
+        --scanners vuln \
+        --exit-code 1 --severity CRITICAL,HIGH --ignore-unfixed \
+        --format table "${FULL_IMAGE}" | tee trivy-image-backend.txt
+  artifacts:
+    when: always
+    paths:
+      - trivy-image-backend.txt
+    expire_in: 7 days
+
+# =============================================================================
+# 7b) Cosign keyless sign (Kyverno can verify in-cluster later)
+# =============================================================================
+# WHY SIGSTORE_ID_TOKEN (aud: sigstore)? AWS_JWT is rejected by Fulcio.
+backend:image-sign:
+  extends:
+    - .backend_rules
+    - .oidc_aws_app_backend
+  stage: image-sign
+  tags: [devsecops]
+  allow_failure: false
+  needs: ["backend:ecr-push"]
+  cache:
+    key: "ci-tools-bin-${COSIGN_VERSION}-${TRIVY_VERSION}"
+    paths:
+      - .ci-cache/bin/
+    policy: pull-push
+  script:
+    - |
+      set -euo pipefail
+      mkdir -p "${CI_TOOLS_DIR}"
+      if [ ! -x "${CI_TOOLS_DIR}/cosign" ]; then
+        echo "Downloading cosign ${COSIGN_VERSION} (cache miss)..."
+        curl -fsSL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" \
+          -o "${CI_TOOLS_DIR}/cosign"
+        chmod +x "${CI_TOOLS_DIR}/cosign"
+        [ "$(wc -c < "${CI_TOOLS_DIR}/cosign")" -gt 10000000 ] \
+          || { echo "cosign download looks too small (not a real binary)"; exit 1; }
+      else
+        echo "Using cached cosign at ${CI_TOOLS_DIR}/cosign"
+      fi
+      REPOSITORY_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      FULL_IMAGE="${REPOSITORY_URI}/${IMAGE_NAME}:${CI_PIPELINE_IID}"
+      aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" \
+        | docker login --username AWS --password-stdin "${REPOSITORY_URI}"
+      "${CI_TOOLS_DIR}/cosign" sign --yes --identity-token="${SIGSTORE_ID_TOKEN}" "${FULL_IMAGE}"
+
+# =============================================================================
+# 8) Update gitops Deployment image + [skip ci] (C1 / C6)
+# =============================================================================
+backend:update-manifest:
+  extends: .backend_rules
+  image:
+    name: alpine/git:v2.47.2
+    entrypoint: [""]
+  stage: update-manifest
+  tags: [devsecops]
+  allow_failure: false
+  needs: ["backend:image-sign", "backend:trivy-image-scan"]
+  script:
+    - |
+      set -euo pipefail
+      REPOSITORY_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      FULL_IMAGE="${REPOSITORY_URI}/${IMAGE_NAME}:${CI_PIPELINE_IID}"
+      git config user.email "ci@gitlab.com"
+      git config user.name "GitLab CI"
+      git fetch origin gitops || git checkout -b gitops
+      git checkout gitops
+      sed -i -E "s|(image:\\s*).*backend:[^[:space:]]+|\\1${FULL_IMAGE}|" ${MANIFEST_DIR}/deployment.yaml
+      sed -i "s|IMAGE_TAG_PLACEHOLDER|${CI_PIPELINE_IID}|g" ${MANIFEST_DIR}/deployment.yaml || true
+      git add ${MANIFEST_DIR}/deployment.yaml
+      git diff --cached --quiet && echo "No manifest changes" && exit 0
+      git commit -m "Update backend deployment image to ${CI_PIPELINE_IID} [skip ci]"
+      git push "https://oauth2:${GITLAB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" HEAD:gitops

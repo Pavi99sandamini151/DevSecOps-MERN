@@ -1,0 +1,84 @@
+# Capacity budgets (2× t3.medium lab): keep Prometheus/Grafana lean.
+# ServiceMonitor discovery must include three-tier namespace (app metrics).
+
+grafana:
+  adminPassword: "CHANGE_ME_GRAFANA_ADMIN"
+  service:
+    type: ClusterIP
+  ingress:
+    enabled: false  # managed via k8s/monitoring-ingress.yaml
+  persistence:
+    enabled: true
+    size: 5Gi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 300m
+      memory: 512Mi
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      access: proxy
+      url: http://loki.monitoring.svc.cluster.local:3100
+      isDefault: false
+      jsonData:
+        maxLines: 1000
+
+prometheus:
+  service:
+    type: ClusterIP
+  prometheusSpec:
+    retention: 7d
+    # Pick up ServiceMonitors in any namespace (backend in three-tier)
+    serviceMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorNamespaceSelector: {}
+    podMonitorSelectorNilUsesHelmValues: false
+    podMonitorNamespaceSelector: {}
+    ruleSelectorNilUsesHelmValues: false
+    ruleNamespaceSelector: {}
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1536Mi
+
+alertmanager:
+  enabled: true
+  service:
+    type: ClusterIP
+  # Demo receiver — replace with Slack/email webhook in real use
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: "null"
+      group_by: ["alertname", "namespace"]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 12h
+    receivers:
+      - name: "null"
+
+kube-state-metrics:
+  enabled: true
+  resources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 256Mi
+
+nodeExporter:
+  enabled: true
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi

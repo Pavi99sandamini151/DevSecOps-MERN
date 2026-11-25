@@ -1,0 +1,8 @@
+# Require review from maintainers for protected-branch merges (sec-protected-branch)
+* @YOUR_GITLAB_NAMESPACE
+
+# Critical paths
+/.gitlab-ci.yml @YOUR_GITLAB_NAMESPACE
+/ci/ @YOUR_GITLAB_NAMESPACE
+/infra/ @YOUR_GITLAB_NAMESPACE
+/k8s/ @YOUR_GITLAB_NAMESPACE

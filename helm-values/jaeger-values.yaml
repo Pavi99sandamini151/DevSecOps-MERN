@@ -1,0 +1,32 @@
+# Jaeger all-in-one — ClusterIP only (no public Ingress; use SSM port-forward)
+provisionDataStore:
+  cassandra: false
+
+allInOne:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 300m
+      memory: 512Mi
+  extraEnv:
+    - name: COLLECTOR_OTLP_ENABLED
+      value: "true"
+
+storage:
+  type: memory
+
+agent:
+  enabled: false
+
+collector:
+  enabled: false
+
+query:
+  enabled: false
+
+# Service for OTLP from otel-collector / apps
+service:
+  type: ClusterIP

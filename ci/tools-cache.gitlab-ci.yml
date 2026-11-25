@@ -1,0 +1,33 @@
+# =============================================================================
+# Shared CI tool versions + cache directories
+# =============================================================================
+# BEGINNER MAP
+#   Every GitLab job starts in a FRESH Docker container. That container has no
+#   memory of the previous pipeline. If we curl Cosign/Trivy/OWASP every time,
+#   each pipeline wastes 10–30+ minutes and can fail when GitHub/NVD is slow.
+#
+#   Solution: download tools once into `.ci-cache/` and tell GitLab
+#   `cache: paths:` so the next job on the same runner restores those files.
+#
+# WHY not just install tools on the EC2 host (install-tools.sh)?
+#   Host tools are great for YOU over SSM. Job containers do NOT see the host
+#   filesystem (except what we explicitly mount, like the Docker socket).
+#   So CI jobs must bring their own binaries via image or cache.
+#
+# PRACTICE
+#   - Pin versions (reproducible builds — "works on my pipeline" forever).
+#   - Store under .ci-cache/ and declare GitLab `cache:` on consuming jobs.
+#   - .gitignore .ci-cache/ so restored dirs never get committed to git.
+# =============================================================================
+
+variables:
+  # Exact Cosign release tag we download on cache miss
+  COSIGN_VERSION: "v2.4.1"
+  # Exact Trivy release we download / use in aquasec/trivy image jobs
+  TRIVY_VERSION: "0.57.1"
+  # Where cosign + trivy CLIs land after download (image-scan / sign jobs)
+  CI_TOOLS_DIR: "${CI_PROJECT_DIR}/.ci-cache/bin"
+  # Where Trivy stores its vulnerability database between scans
+  TRIVY_CACHE_DIR: "${CI_PROJECT_DIR}/.ci-cache/trivy"
+  # Where Terraform + AWS CLI live for ci/infra.gitlab-ci.yml
+  INFRA_TOOLS_DIR: "${CI_PROJECT_DIR}/.ci-cache/infra-tools"

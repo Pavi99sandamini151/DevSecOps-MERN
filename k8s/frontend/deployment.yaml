@@ -1,0 +1,80 @@
+# =============================================================================
+# Frontend Deployment — what Kubernetes runs for the React UI
+# =============================================================================
+# BEGINNER MAP
+#   A Deployment says: "keep N copies of this Pod template healthy".
+#   CI updates the `image:` field on the gitops branch; ArgoCD applies it (C1).
+#
+# WHY runAsUser 1000?
+#   Matches the `node` user inside our Docker image. If the image ran as root
+#   but the Pod forced uid 1000, the process could not start (C10).
+#
+# WHY readOnlyRootFilesystem + emptyDir /tmp?
+#   Attackers cannot write malware onto the container filesystem. /tmp is the
+#   only writable place, and it is wiped when the Pod dies.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: three-tier
+  labels:
+    role: frontend
+    env: demo
+spec:
+  # Two replicas → survive one node/pod failure (pair with PDB)
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1          # can create 1 extra Pod during rollout
+      maxUnavailable: 25%  # never take down more than 25% at once
+  selector:
+    matchLabels:
+      role: frontend
+  template:
+    metadata:
+      labels:
+        role: frontend
+    spec:
+      serviceAccountName: frontend-sa
+      # Frontend does not call the Kubernetes API — do not mount a token (C10)
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: frontend
+        # CI replaces this whole image ref with ACCOUNT…/frontend:<pipeline_iid>
+        # IMAGE_TAG_PLACEHOLDER is only for the very first bootstrap commit
+        image: ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/frontend:IMAGE_TAG_PLACEHOLDER
+        imagePullPolicy: Always
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"] # drop every Linux capability (no raw sockets, etc.)
+        env:
+          - name: REACT_APP_BACKEND_URL
+            value: "https://devops.example.com/api/tasks"
+        ports:
+        - containerPort: 3000 # must match Dockerfile EXPOSE + Service targetPort
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        volumeMounts:
+          - name: tmp
+            mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {} # writable scratch space when root FS is read-only
